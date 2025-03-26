@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 """
 Single-file PyQt6 + Flask + Paramiko Explorer with Draggable Splitters,
-Custom Scrollbars, and Plain Terminal Output
+Custom Scrollbars, Enhanced File Previews, Database & Document Support,
+and Improved Terminal & Upload Functionality.
 
-Features:
-- PyQt login dialog (or curses fallback) with default port "22" and username "root"
-- Control dialog with improved process management
-- Web interface with two tabs:
-    • Explorer: Scrollable directory tree and Code Editor separated by a draggable vertical splitter.
-    • Terminal: A realistic terminal emulator with a draggable horizontal splitter between output and input.
-- Custom CSS styles for scrollbars.
-- Terminal output is rendered as plain text (ANSI codes will not be converted).
+Features (additional finishing touches):
+- Smart file display: Hidden config files (e.g. .bashrc) and text files are shown in CodeMirror.
+- Database file support: SQLite (.sqlite/.db) files are parsed and rendered as tables.
+- DOC/DOCX support: Display a “preview not available” message with download options.
+- Terminal enhancements:
+   • Terminal input is fixed at the bottom.
+   • Streaming endpoint (/terminal/stream/) handles long-running commands (e.g. “pm2 logs”) with ANSI-to-HTML conversion.
+- File uploads now use XMLHttpRequest for per‑file progress with a visible progress bar.
+- Various tweaks for better cross-platform and non‐blocking behavior.
 """
 
-import sys, os, stat, time, threading, random, socket, io, re, tempfile
+import os, sys
+
+# FIX: Set the Qt platform for environments like Termux (where libEGL might be missing)
+if sys.platform.startswith("linux") and os.environ.get("TERMUX"):
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+import stat, time, threading, random, socket, io, re, tempfile, sqlite3
 import paramiko
-from flask import Flask, request, jsonify, send_file, render_template_string
+from flask import Flask, request, jsonify, send_file, render_template_string, Response
 from werkzeug.serving import make_server
+from ansi2html import Ansi2HTMLConverter
+
 
 # ----------------- GLOBALS -----------------
 global_ssh_client = None
@@ -27,7 +37,10 @@ server_thread = None
 app = Flask(__name__)
 
 # ----------------- HTML TEMPLATE -----------------
-# Note the new <div> elements with ids "splitter-explorer" and "splitter-terminal"
+# Note: Modifications include:
+# • A theme selector and actions dropdown in the editor header.
+# • Updated CSS so that the terminal output scrolls and the input stays fixed at the bottom.
+# • Inclusion of ansi_up.js for ANSI conversion.
 EXPLORER_TEMPLATE = r"""
 <!DOCTYPE html>
 <html>
@@ -45,6 +58,9 @@ EXPLORER_TEMPLATE = r"""
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/addon/display/indent-guide.min.css">
   <!-- Font Awesome for icons -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <!-- ansi_up for terminal ANSI conversion -->
+  <script src="https://cdn.jsdelivr.net/npm/ansi-to-html@0.7.2/lib/ansi_to_html.bundle.min.js"></script>
+
 
   <script src="https://code.jquery.com/jquery-3.6.4.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js"></script>
@@ -64,9 +80,17 @@ EXPLORER_TEMPLATE = r"""
       height: 100%;
       margin: 0;
       overflow: hidden;
+      font-family: monospace;
+    }
+    /* Default dark theme colors */
+    body.dark-mode {
       background-color: #000;
       color: #0ff;
-      font-family: monospace;
+    }
+    /* Light theme override */
+    body.light-mode {
+      background-color: #fff;
+      color: #000;
     }
     /* Scrollbar styling for WebKit */
     ::-webkit-scrollbar {
@@ -158,18 +182,8 @@ EXPLORER_TEMPLATE = r"""
       margin: 0;
       position: relative;
       padding: 5px 0 5px 20px;
-      text-wrap-mode: nowrap;
       color: wheat;
-    }
-    .tree-view li::before {
-      content: '';
-      position: absolute;
-      top: 5px;
-      left: -6px;
-      width: 21px;
-      border-bottom: 1px solid grey;
-      border-bottom-left-radius: 3rem;
-      padding: 5px;
+      font-size: large;
     }
     .tree-view li.selected > span {
       font-weight: bold;
@@ -189,6 +203,7 @@ EXPLORER_TEMPLATE = r"""
       justify-content: space-between;
       background-color: #111;
       flex-shrink: 0;
+      align-items: center;
     }
     .editor-content {
       flex-grow: 1;
@@ -199,41 +214,54 @@ EXPLORER_TEMPLATE = r"""
       height: 100% !important;
       font-family: monospace;
     }
-    /* Terminal container: added horizontal splitter */
+    /* Terminal container adjustments:
+       - The terminal container is positioned relative.
+       - The output area scrolls with a margin reserved for the input.
+       - The terminal input is fixed at the bottom.
+    */
     #terminal-container {
-      display: none;
-      flex-direction: column;
-      background-color: #000;
-      padding: 10px;
-      box-sizing: border-box;
+      position: relative;
+      height: calc(100% - 45px);
+      background-color: inherit;
       overflow: hidden;
     }
     #terminal-output {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 40px; /* reserve space for input */
       overflow-y: auto;
-      background-color: #000;
       border: 1px solid #0ff;
       padding: 10px;
-      font-family: monospace;
       white-space: pre-wrap;
-    }
-    /* Draggable horizontal splitter */
-    #splitter-terminal {
-      height: 5px;
-      cursor: row-resize;
-      background-color: #0ff;
+      background-color: inherit;
     }
     #terminal-input {
-      width: 100%;
-      background-color: #000;
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
       border: 1px solid #0ff;
-      color: #0ff;
       padding: 5px;
       font-family: monospace;
       box-sizing: border-box;
+      background-color: inherit;
+      color: inherit;
+    }
+    /* Upload progress styling */
+    #uploadProgress {
+      position: fixed;
+      top: 20%;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 300px;
+      z-index: 2000;
+      display: none;
     }
   </style>
 </head>
-<body>
+<body class="dark-mode">
   <!-- Navigation Tabs -->
   <ul class="nav nav-tabs">
     <li class="nav-item">
@@ -272,21 +300,41 @@ EXPLORER_TEMPLATE = r"""
           <span id="currentPath" class="fw-bold">No file selected</span>
           <span id="fileTypeTag" class="badge bg-secondary ms-2"></span>
           <button class="btn btn-sm btn-success" id="saveFileBtn">Save File</button>
+          <!-- New Actions Dropdown in header for selected file/folder -->
+          <div class="dropdown ms-3">
+            <button class="btn btn-sm btn-info dropdown-toggle" type="button" id="actionDropdown" data-bs-toggle="dropdown" aria-expanded="false">
+              Actions
+            </button>
+            <ul class="dropdown-menu" aria-labelledby="actionDropdown">
+              <li><a class="dropdown-item" href="#" onclick="downloadFileAction()">Download</a></li>
+              <li><a class="dropdown-item" href="#" onclick="deletePath()">Delete</a></li>
+              <li><a class="dropdown-item" href="#" onclick="renameFileAction()">Rename</a></li>
+            </ul>
+          </div>
+          <!-- Theme selection dropdown -->
+          <select id="themeSelect" class="form-select form-select-sm ms-3" style="width:auto; display:inline-block;">
+            <option value="rubyblue" selected>Ruby Blue (Dark)</option>
+            <option value="monokai">Monokai (Dark)</option>
+            <option value="erlang-dark">Erlang Dark (Dark)</option>
+            <option value="default">Default (Light)</option>
+          </select>
         </div>
-        <div class="editor-content">
+        <div class="editor-content" id="editor-content">
           <textarea id="codeEditor"></textarea>
         </div>
       </div>
     </div>
-    <!-- Terminal Container with adjustable splitter -->
-    <div id="terminal-container" class="d-flex">
+    <!-- Terminal Container -->
+    <div id="terminal-container">
       <div id="terminal-output"></div>
-      <div id="splitter-terminal"></div>
       <input type="text" id="terminal-input" placeholder="Type your command and hit Enter...">
     </div>
   </div>
-
-  <!-- CREATE ITEM MODAL -->
+  <!-- Upload Progress Bar -->
+  <div id="uploadProgress" class="progress">
+    <div id="uploadBar" class="progress-bar" role="progressbar" style="width: 0%;">0%</div>
+  </div>
+  <!-- CREATE ITEM MODAL (unchanged) -->
   <div class="modal fade" id="createItemModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered">
       <div class="modal-content" style="background-color:#111; color:#0ff;">
@@ -319,8 +367,18 @@ EXPLORER_TEMPLATE = r"""
   let currentSelectedPath = null;
   let currentSelectedElement = null;
   let editor = null;
-  // Terminal prompt string (simulate (venv) if needed)
   let terminalPrompt = "vps@remote:~$ ";
+
+  // Helper: decide if file should be opened in the text editor.
+  // Now includes common hidden config files and recognized text extensions.
+  function shouldOpenInEditor(path) {
+    let lower = path.toLowerCase();
+    const textExts = [".py", ".js", ".html", ".htm", ".css", ".md", ".xml", ".json", ".txt", ".sql", ".bashrc", ".bash_profile", ".profile", ".gitignore", ".env", ".ini", ".conf"];
+    for (let ext of textExts) {
+      if(lower.endsWith(ext)) return true;
+    }
+    return false;
+  }
 
   document.addEventListener("DOMContentLoaded", function(){
     // Initialize CodeMirror editor for Explorer
@@ -331,7 +389,6 @@ EXPLORER_TEMPLATE = r"""
       indentWithTabs: true,
       indentUnit: 4,
       tabSize: 4,
-      highlightSelectionMatches: true,
       styleActiveLine: true,
       gutters: ["CodeMirror-linenumbers", "CodeMirror-foldgutter"],
       indentGuide: true
@@ -348,22 +405,22 @@ EXPLORER_TEMPLATE = r"""
         alert("Select a directory first.");
         return;
       }
-      let target = prompt("Enter target directory for upload:", currentSelectedPath);
-      if(target === null) return;
+      let target = currentSelectedPath;
+      if(!target.endsWith("/") && !target.endsWith("\\")) {
+         // if a file is selected, use its parent
+         target = parentDir(target);
+      }
       document.getElementById("uploadInput").dataset.targetPath = target;
       document.getElementById("uploadInput").click();
     });
-    document.getElementById("uploadInput").addEventListener("change", uploadFiles);
+    document.getElementById("uploadInput").addEventListener("change", uploadFilesWithProgress);
     document.getElementById("deletePathBtn").addEventListener("click", deletePath);
     document.getElementById("downloadBtn").addEventListener("click", function(e){
       if(!currentSelectedPath){
         e.preventDefault();
         alert("Select a file/folder to download.");
       } else {
-        let target = prompt("Enter target path for download (or leave blank for current):", currentSelectedPath);
-        if(target === null) { e.preventDefault(); return; }
-        if(target.trim() === "") target = currentSelectedPath;
-        this.href = "/download/?path=" + encodeURIComponent(target);
+        this.href = "/download/?path=" + encodeURIComponent(currentSelectedPath);
       }
     });
 
@@ -371,14 +428,14 @@ EXPLORER_TEMPLATE = r"""
     document.getElementById("tab-explorer").addEventListener("click", function(e){
       e.preventDefault();
       document.getElementById("explorer-container").style.display = "flex";
-      document.getElementById("terminal-container").style.display = "none";
+      document.getElementById("terminal-container").style.display = "block";
       document.querySelector("#tab-explorer").classList.add("active");
       document.querySelector("#tab-terminal").classList.remove("active");
     });
     document.getElementById("tab-terminal").addEventListener("click", function(e){
       e.preventDefault();
       document.getElementById("explorer-container").style.display = "none";
-      document.getElementById("terminal-container").style.display = "flex";
+      document.getElementById("terminal-container").style.display = "block";
       document.querySelector("#tab-terminal").classList.add("active");
       document.querySelector("#tab-explorer").classList.remove("active");
       let termOut = document.getElementById("terminal-output");
@@ -394,8 +451,26 @@ EXPLORER_TEMPLATE = r"""
         let cmd = this.value.trim();
         if(cmd === "") return;
         appendToTerminal("\n" + cmd + "\n");
-        executeTerminalCommand(cmd);
+        // For long-running commands (e.g., pm2 logs) use stream
+        if(cmd.startsWith("pm2 logs")) {
+          executeTerminalCommandStream(cmd);
+        } else {
+          executeTerminalCommand(cmd);
+        }
         this.value = "";
+      }
+    });
+
+    // Theme selection handler
+    document.getElementById("themeSelect").addEventListener("change", function() {
+      var theme = this.value;
+      editor.setOption("theme", theme);
+      if(theme === "default"){
+         document.body.classList.remove("dark-mode");
+         document.body.classList.add("light-mode");
+      } else {
+         document.body.classList.remove("light-mode");
+         document.body.classList.add("dark-mode");
       }
     });
 
@@ -420,36 +495,18 @@ EXPLORER_TEMPLATE = r"""
       document.removeEventListener("mousemove", onDragExplorer);
       document.removeEventListener("mouseup", stopDragExplorer);
     }
-
-    // Set up splitter for Terminal (horizontal)
-    const splitterTerminal = document.getElementById("splitter-terminal");
-    const terminalOutput = document.getElementById("terminal-output");
-    splitterTerminal.addEventListener("mousedown", function(e) {
-      e.preventDefault();
-      document.addEventListener("mousemove", onDragTerminal);
-      document.addEventListener("mouseup", stopDragTerminal);
-    });
-    function onDragTerminal(e) {
-      const containerRect = document.getElementById("terminal-container").getBoundingClientRect();
-      let newOutputHeight = e.clientY - containerRect.top;
-      if(newOutputHeight < 50) newOutputHeight = 50;
-      if(newOutputHeight > containerRect.height - 30) newOutputHeight = containerRect.height - 30;
-      terminalOutput.style.height = newOutputHeight + "px";
-    }
-    function stopDragTerminal(e) {
-      document.removeEventListener("mousemove", onDragTerminal);
-      document.removeEventListener("mouseup", stopDragTerminal);
-    }
   });
 
-  // Append text to terminal output with auto-scroll
-  function appendToTerminal(text) {
+  // Append text to terminal output with ANSI conversion
+    function appendToTerminal(htmlText) {
     let termOut = document.getElementById("terminal-output");
-    termOut.innerHTML += text;
+    termOut.innerHTML += htmlText;
     termOut.scrollTop = termOut.scrollHeight;
   }
 
-  // Execute terminal command via AJAX
+
+
+  // Execute terminal command (non-streaming)
   async function executeTerminalCommand(cmd) {
     let fd = new FormData();
     fd.append("command", cmd);
@@ -465,6 +522,32 @@ EXPLORER_TEMPLATE = r"""
       appendToTerminal("Request failed: " + err + "\n" + terminalPrompt);
     }
   }
+
+  // Execute terminal command using streaming (for long-running commands)
+  async function executeTerminalCommandStream(cmd) {
+    let fd = new FormData();
+    fd.append("command", cmd);
+    try {
+      let response = await fetch("/terminal/stream/", { method:"POST", body: fd });
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      function read() {
+        reader.read().then(({ done, value }) => {
+          if (done) {
+            appendToTerminal("\n" + terminalPrompt);
+            return;
+          }
+          // Directly append the HTML (already converted by ansi2html on the server)
+          appendToTerminal(decoder.decode(value));
+          read();
+        });
+      }
+      read();
+    } catch(err) {
+      appendToTerminal("Stream failed: " + err + "\n" + terminalPrompt);
+    }
+  }
+
 
   // Format file sizes
   function formatSize(bytes) {
@@ -502,26 +585,97 @@ EXPLORER_TEMPLATE = r"""
     } else if(path.endsWith(".json")){
       mode = "javascript";
       fileType = "JSON";
+    } else if(path.endsWith(".sql")){
+      mode = "sql";
+      fileType = "SQL";
     }
     return { mode, fileType };
   }
 
-  // Load file content and update CodeMirror
+  // Load file content and update CodeMirror or alternative display
   async function loadFileContents(path) {
-    let url = "/ajax/file/?path=" + encodeURIComponent(path);
-    let res = await fetch(url);
-    let data = await res.json();
-    if(data.status === 'ok'){
-      editor.setValue(data.content);
-      let { mode, fileType } = detectModeFromExtension(path);
-      editor.setOption("mode", mode);
-      document.getElementById("fileTypeTag").textContent = fileType;
+    currentSelectedPath = path;
+    document.getElementById("currentPath").textContent = path;
+    let lower = path.toLowerCase();
+    // For SQLite database files, use the dedicated endpoint
+    if(lower.endsWith(".sqlite") || lower.endsWith(".db")){
+      let res = await fetch("/ajax/sqlite/?path=" + encodeURIComponent(path));
+      let data = await res.json();
+      if(data.status === "ok"){
+        let html = "<h5>SQLite Database Preview</h5>";
+        for(let table in data.data) {
+          html += "<h6>" + table + "</h6>";
+          let tdata = data.data[table];
+          html += "<table class='table table-sm table-bordered'><thead><tr>";
+          tdata.columns.forEach(col => { html += "<th>" + col + "</th>"; });
+          html += "</tr></thead><tbody>";
+          tdata.rows.forEach(row => {
+            html += "<tr>";
+            row.forEach(cell => { html += "<td>" + cell + "</td>"; });
+            html += "</tr>";
+          });
+          html += "</tbody></table>";
+        }
+        document.getElementById("editor-content").innerHTML = html;
+        document.getElementById("fileTypeTag").textContent = "SQLite DB";
+      } else {
+        alert(data.message || "Error loading database file.");
+      }
+    }
+    // DOC/DOCX files: show message (preview not available)
+    else if(lower.endsWith(".doc") || lower.endsWith(".docx")){
+      let html = "<div class='alert alert-info'>Preview not available for DOC/DOCX files.</div>";
+      html += "<button class='btn btn-sm btn-primary' onclick='downloadFileAction()'>Download</button>";
+      document.getElementById("editor-content").innerHTML = html;
+      document.getElementById("fileTypeTag").textContent = "Document";
+    }
+    else if (shouldOpenInEditor(path)) {
+      // For text files, load via AJAX and display in CodeMirror
+      let url = "/ajax/file/?path=" + encodeURIComponent(path);
+      let res = await fetch(url);
+      let data = await res.json();
+      if(data.status === 'ok'){
+        document.getElementById("editor-content").innerHTML = '<textarea id="codeEditor"></textarea>';
+        editor = CodeMirror.fromTextArea(document.getElementById("codeEditor"), {
+          lineNumbers: true,
+          mode: "markdown",
+          theme: document.getElementById("themeSelect").value,
+          indentWithTabs: true,
+          indentUnit: 4,
+          tabSize: 4,
+          styleActiveLine: true,
+          gutters: ["CodeMirror-linenumbers", "CodeMirror-foldgutter"],
+          indentGuide: true
+        });
+        editor.setValue(data.content);
+        let { mode, fileType } = detectModeFromExtension(path);
+        editor.setOption("mode", mode);
+        document.getElementById("fileTypeTag").textContent = fileType;
+      } else {
+        alert(data.message || "Error loading file.");
+      }
     } else {
-      alert(data.message || "Error loading file.");
+      // For non-text files (images, PDFs, videos, etc.)
+      let editorContent = document.getElementById("editor-content");
+      if(lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".gif") || lower.endsWith(".bmp") || lower.endsWith(".svg")){
+         editorContent.innerHTML = "<img src='/download/?path=" + encodeURIComponent(path) + "&inline=1' style='max-width:100%; max-height:100%;'/>";
+      } else if(lower.endsWith(".pdf")){
+         editorContent.innerHTML = "<iframe src='/download/?path=" + encodeURIComponent(path) + "&inline=1' style='width:100%; height:100%; border:none;'></iframe>";
+      } else if(lower.endsWith(".mp4") || lower.endsWith(".avi") || lower.endsWith(".mov") || lower.endsWith(".wmv") || lower.endsWith(".flv")){
+         editorContent.innerHTML = "<video controls style='width:100%; height:100%;'><source src='/download/?path=" + encodeURIComponent(path) + "&inline=1'></video>";
+      } else {
+         let message = "<div class='alert alert-info'>Cannot display this file type in the editor.</div>";
+         message += "<button class='btn btn-sm btn-primary' onclick='downloadFileAction()'>Download</button> ";
+         message += "<button class='btn btn-sm btn-danger' onclick='deletePath()'>Delete</button> ";
+         message += "<button class='btn btn-sm btn-warning' onclick='renameFileAction()'>Rename</button>";
+         editorContent.innerHTML = message;
+         if(editor) { editor.toTextArea(); editor = null; }
+         document.getElementById("fileTypeTag").textContent = "";
+       }
     }
   }
 
-  // Build directory tree recursively
+  // Build directory tree recursively (unchanged)
   function buildDirectoryTree(path, container) {
     container.innerHTML = "";
     fetch("/ajax/list/?path=" + encodeURIComponent(path))
@@ -583,7 +737,7 @@ EXPLORER_TEMPLATE = r"""
     });
   }
 
-  // Toggle directory expansion
+  // Toggle directory expansion (unchanged)
   function toggleDirectory(li, dirPath, toggleIcon) {
     let existingUl = li.querySelector("ul");
     if(existingUl) {
@@ -676,7 +830,7 @@ EXPLORER_TEMPLATE = r"""
     return path.endsWith("/") || path.endsWith("\\");
   }
 
-  // Save file
+  // Save file (unchanged)
   function saveFile(){
     if(!currentSelectedPath){
       alert("Select a file first!");
@@ -707,7 +861,7 @@ EXPLORER_TEMPLATE = r"""
     });
   }
 
-  // Delete path (file or folder)
+  // Delete path (unchanged)
   function deletePath(){
     if(!currentSelectedPath){
       alert("Select a file/folder first.");
@@ -726,7 +880,7 @@ EXPLORER_TEMPLATE = r"""
         alert("Deleted successfully: " + currentSelectedPath);
         buildDirectoryTree(basePath, document.getElementById("directoryTree"));
         if(!isDirPath(currentSelectedPath)){
-          editor.setValue("");
+          if(editor){ editor.setValue(""); }
           document.getElementById("fileTypeTag").textContent = "";
           document.getElementById("currentPath").textContent = "";
         }
@@ -740,7 +894,7 @@ EXPLORER_TEMPLATE = r"""
     });
   }
 
-  // Modal for creating files/folders
+  // Modal for creating files/folders (unchanged)
   function openCreateModal(type){
     if(!currentSelectedPath){
       alert("Select a directory first!");
@@ -766,7 +920,7 @@ EXPLORER_TEMPLATE = r"""
     };
   }
 
-  // Create item (file/folder)
+  // Create item (file/folder) (unchanged)
   function createItem(parent, name, type){
     let fd = new FormData();
     fd.append("parent_path", parent);
@@ -787,30 +941,83 @@ EXPLORER_TEMPLATE = r"""
     });
   }
 
-  // Upload multiple files
-  function uploadFiles(){
+  // Upload files using XMLHttpRequest with progress events
+  function uploadFilesWithProgress(){
     let files = this.files;
-    if(!files || files.length===0) return;
-    let target = this.dataset.targetPath || currentSelectedPath;
-    if(!isDirPath(target)) target = parentDir(target);
-    let fd = new FormData();
-    fd.append("parent_path", target);
-    for(let i=0; i<files.length; i++){
-      fd.append("file_"+i, files[i]);
+    if(!files || files.length === 0) return;
+    let target = this.dataset.targetPath;
+    let progressDiv = document.getElementById("uploadProgress");
+    let progressBar = document.getElementById("uploadBar");
+    progressDiv.style.display = "block";
+    let totalFiles = files.length, uploaded = 0;
+    function uploadSingle(file, index, callback) {
+      let xhr = new XMLHttpRequest();
+      xhr.open("POST", "/ajax/upload/");
+      xhr.upload.addEventListener("progress", function(e) {
+         if(e.lengthComputable){
+           let percent = Math.round((e.loaded / e.total) * 100);
+           progressBar.style.width = percent + "%";
+           progressBar.innerHTML = percent + "%";
+         }
+      });
+      xhr.onreadystatechange = function() {
+        if(xhr.readyState === 4) {
+          uploaded++;
+          callback();
+        }
+      };
+      let fd = new FormData();
+      fd.append("parent_path", target);
+      fd.append("file_0", file);
+      xhr.send(fd);
     }
-    fetch("/ajax/upload/", { method:"POST", body: fd })
-    .then(r=>r.json())
-    .then(data=>{
-      if(data.status === 'ok'){
-        alert(data.message + "\nUploaded to: " + target);
+    function uploadNext(i) {
+      if(i >= totalFiles) {
+        alert("All files uploaded.");
+        progressDiv.style.display = "none";
         buildDirectoryTree(basePath, document.getElementById("directoryTree"));
-      } else {
-        alert("Error: " + data.message);
+        return;
       }
-    })
-    .catch(err=>{
-      alert("Failed to upload: " + err);
-    });
+      uploadSingle(files[i], i, function() {
+        uploadNext(i+1);
+      });
+    }
+    uploadNext(0);
+  }
+
+  // Action functions for non-text files
+  function downloadFileAction() {
+    if(currentSelectedPath){
+      window.location.href = "/download/?path=" + encodeURIComponent(currentSelectedPath);
+    }
+  }
+
+  function renameFileAction() {
+    if(!currentSelectedPath){
+      alert("No file selected!");
+      return;
+    }
+    let parts = currentSelectedPath.split("/");
+    let currentName = parts[parts.length-1];
+    let newName = prompt("Enter new name for the file/folder:", currentName);
+    if(newName){
+      let fd = new FormData();
+      fd.append("old_path", currentSelectedPath);
+      fd.append("new_name", newName);
+      fetch("/ajax/rename/", { method:"POST", body: fd })
+      .then(r=>r.json())
+      .then(data=>{
+        if(data.status === "ok"){
+          alert("Renamed successfully.");
+          buildDirectoryTree(basePath, document.getElementById("directoryTree"));
+        } else {
+          alert("Error: " + data.message);
+        }
+      })
+      .catch(err=>{
+        alert("Rename failed: " + err);
+      });
+    }
   }
 </script>
 </body>
@@ -940,7 +1147,7 @@ def ajax_upload():
             parent_path = os.path.dirname(parent_path)
     except:
         pass
-    upload_count = 0
+    # Expect only one file per request (the progress uploader sends one file at a time)
     for key in request.files.keys():
         f = request.files[key]
         if f:
@@ -949,13 +1156,13 @@ def ajax_upload():
             remote_path = sanitize_path(os.path.join(parent_path, f.filename))
             try:
                 global_sftp_client.put(temp_path, remote_path)
-                upload_count += 1
             except Exception as e:
                 return jsonify(status="error", message=str(e))
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
-    return jsonify(status="ok", message=f"Uploaded {upload_count} file(s)")
+            break
+    return jsonify(status="ok", message="File uploaded")
 
 @app.route("/download/", methods=["GET"])
 def download_file():
@@ -964,16 +1171,13 @@ def download_file():
     path = request.args.get("path", "")
     if not path:
         return "No path provided", 400
+    inline = request.args.get("inline", "0") == "1"
     try:
         st = global_sftp_client.stat(path)
-        # Check if the path is a directory
         if stat.S_ISDIR(st.st_mode):
             import zipfile
-            # Create a temporary ZIP file
             tmp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
             tmp_zip.close()
-            
-            # Recursive function to add remote directory contents to the ZIP file
             def add_dir_to_zip(sftp, remote_path, zip_path):
                 for attr in sftp.listdir_attr(remote_path):
                     remote_item = os.path.join(remote_path, attr.filename).replace("\\", "/")
@@ -984,23 +1188,18 @@ def download_file():
                         with sftp.open(remote_item, "rb") as file_obj:
                             data = file_obj.read()
                         zipf.writestr(zip_item, data)
-            
             with zipfile.ZipFile(tmp_zip.name, "w", zipfile.ZIP_DEFLATED) as zipf:
-                # Use the basename of the directory as the root folder in the ZIP archive.
                 add_dir_to_zip(global_sftp_client, path, os.path.basename(path))
-            
-            return send_file(tmp_zip.name, as_attachment=True, download_name=os.path.basename(path) + ".zip")
+            return send_file(tmp_zip.name, as_attachment=not inline, download_name=os.path.basename(path) + ".zip")
         else:
-            # If it's a file, download it directly.
             tmpf = tempfile.NamedTemporaryFile(delete=False)
             global_sftp_client.get(path, tmpf.name)
             tmpf.close()
-            return send_file(tmpf.name, as_attachment=True, download_name=os.path.basename(path))
+            return send_file(tmpf.name, as_attachment=not inline, download_name=os.path.basename(path))
     except Exception as e:
         return str(e), 500
 
-
-# New route: Terminal command execution
+# New route: Terminal command execution (non-streaming)
 @app.route("/terminal/execute/", methods=["POST"])
 def terminal_execute():
     if not global_ssh_client:
@@ -1010,8 +1209,91 @@ def terminal_execute():
         return jsonify(status="error", message="No command provided")
     try:
         stdin, stdout, stderr = global_ssh_client.exec_command(cmd)
+        # Read the command output
         output = stdout.read().decode("utf-8") + stderr.read().decode("utf-8")
-        return jsonify(status="ok", output=output)
+        # Convert ANSI to HTML
+        conv = Ansi2HTMLConverter(inline=True)
+        html = conv.convert(output, full=False)
+        return jsonify(status="ok", output=html)
+    except Exception as e:
+        return jsonify(status="error", message=str(e))
+
+# New route: Terminal streaming endpoint for long-running commands
+@app.route("/terminal/stream/", methods=["POST"])
+def terminal_stream():
+    if not global_ssh_client:
+        return jsonify(status="error", message="SSH not connected!")
+    cmd = request.form.get("command", "")
+    if not cmd:
+        return jsonify(status="error", message="No command provided")
+    # Create a new converter instance for this stream
+    conv = Ansi2HTMLConverter(inline=True)
+    def generate():
+        try:
+            transport = global_ssh_client.get_transport()
+            channel = transport.open_session()
+            channel.exec_command(cmd)
+            while True:
+                if channel.recv_ready():
+                    data = channel.recv(1024)
+                    if not data:
+                        break
+                    chunk = data.decode("utf-8", errors="replace")
+                    # Convert the received chunk to HTML
+                    html_chunk = conv.convert(chunk, full=False)
+                    yield html_chunk
+                if channel.exit_status_ready():
+                    break
+                time.sleep(0.1)
+            # Optionally yield any final conversion output here if needed
+        except Exception as e:
+            yield "<br>Error: " + str(e)
+    return Response(generate(), mimetype="text/html")
+
+
+# New route: SQLite database preview endpoint
+@app.route("/ajax/sqlite/", methods=["GET"])
+def ajax_sqlite():
+    if not global_sftp_client:
+        return jsonify(status="error", message="SFTP client not connected!")
+    path = request.args.get("path", "")
+    if not path:
+        return jsonify(status="error", message="No path provided")
+    try:
+        tmpf = tempfile.NamedTemporaryFile(delete=False)
+        tmpf.close()
+        global_sftp_client.get(path, tmpf.name)
+        conn = sqlite3.connect(tmpf.name)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = cur.fetchall()
+        data = {}
+        for table in tables:
+            table_name = table[0]
+            cur.execute(f"SELECT * FROM {table_name} LIMIT 10;")
+            rows = cur.fetchall()
+            cur.execute(f"PRAGMA table_info({table_name});")
+            columns = [info[1] for info in cur.fetchall()]
+            data[table_name] = {"columns": columns, "rows": rows}
+        conn.close()
+        os.remove(tmpf.name)
+        return jsonify(status="ok", data=data)
+    except Exception as e:
+        return jsonify(status="error", message=str(e))
+
+# New route: Rename file/folder (unchanged from previous version)
+@app.route("/ajax/rename/", methods=["POST"])
+def ajax_rename():
+    if not global_sftp_client:
+        return jsonify(status="error", message="SFTP not connected!")
+    old_path = request.form.get("old_path", "")
+    new_name = request.form.get("new_name", "")
+    if not old_path or not new_name:
+        return jsonify(status="error", message="Missing parameters")
+    new_path = sanitize_path(os.path.join(os.path.dirname(old_path), new_name))
+    try:
+        global_sftp_client.rename(old_path, new_path)
+        return jsonify(status="ok", message="Renamed successfully")
     except Exception as e:
         return jsonify(status="error", message=str(e))
 
@@ -1026,8 +1308,8 @@ from PyQt6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton
 )
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtGui import QPixmap, QDesktopServices
 import qrcode
 
 class LoginDialog(QDialog):
@@ -1040,10 +1322,10 @@ class LoginDialog(QDialog):
         self.ip_edit.setPlaceholderText("IP Address (e.g. 1.2.3.4)")
         self.port_edit = QLineEdit()
         self.port_edit.setPlaceholderText("Port (22)")
-        self.port_edit.setText("22")  # Default port
+        self.port_edit.setText("22")
         self.user_edit = QLineEdit()
         self.user_edit.setPlaceholderText("Username")
-        self.user_edit.setText("root")  # Default username
+        self.user_edit.setText("root")
         self.pass_edit = QLineEdit()
         self.pass_edit.setPlaceholderText("Password")
         self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -1180,13 +1462,8 @@ class ControlDialog(QDialog):
         self.start_server()
     def open_in_browser(self):
         if self.url_label.text():
-            url = self.url_label.text()
-            if os.name == 'nt':
-                os.system(f'start {url}')
-            elif sys.platform.startswith('darwin'):
-                os.system(f'open {url}')
-            else:
-                os.system(f'xdg-open {url}')
+            url = QUrl(self.url_label.text())
+            QDesktopServices.openUrl(url)
 
 # ----------------- CURSES FALLBACK INTERFACE -----------------
 def curses_interface():
